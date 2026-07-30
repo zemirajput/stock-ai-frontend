@@ -8,9 +8,6 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.predict import predict_stock
-from app.transfer_prediction import predict_transfer_stock
-
 
 # -------------------------------------------------
 # FastAPI application
@@ -780,6 +777,8 @@ def create_prediction(
         # -----------------------------------------
 
         if model_name == "lstm":
+            from app.predict import predict_stock
+
             prediction = predict_stock(
                 ticker=ticker,
                 model_name="lstm"
@@ -796,6 +795,8 @@ def create_prediction(
         # -----------------------------------------
 
         if model_name == "cnn_lstm":
+            from app.predict import predict_stock
+
             prediction = predict_stock(
                 ticker=ticker,
                 model_name="cnn_lstm"
@@ -812,6 +813,8 @@ def create_prediction(
         # -----------------------------------------
 
         if model_name == "transfer_learning":
+            from app.transfer_prediction import predict_transfer_stock
+
             prediction = (
                 predict_transfer_stock(
                     ticker=ticker
@@ -829,35 +832,22 @@ def create_prediction(
         # -----------------------------------------
 
         if model_name == "all":
-            lstm_prediction = predict_stock(
-                ticker=ticker,
-                model_name="lstm"
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": (
+                        "The 'all' option is disabled on the Render "
+                        "512 MiB free instance because loading TensorFlow "
+                        "and Chronos together causes an out-of-memory "
+                        "shutdown. Request one model at a time."
+                    ),
+                    "supported_single_models": [
+                        "lstm",
+                        "cnn_lstm",
+                        "transfer_learning"
+                    ]
+                }
             )
-
-            cnn_lstm_prediction = predict_stock(
-                ticker=ticker,
-                model_name="cnn_lstm"
-            )
-
-            transfer_prediction = (
-                predict_transfer_stock(
-                    ticker=ticker
-                )
-            )
-
-            predictions = {
-                "lstm": lstm_prediction,
-                "cnn_lstm": cnn_lstm_prediction,
-                "transfer_learning": (
-                    transfer_prediction
-                )
-            }
-
-            return {
-                "status": "success",
-                "ticker": ticker,
-                "predictions": predictions
-            }
 
         raise HTTPException(
             status_code=400,

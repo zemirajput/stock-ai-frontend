@@ -1,25 +1,9 @@
+import gc
 import os
 import pickle
+from typing import Any
+
 import numpy as np
-import keras
-
-from keras.models import load_model
-from app.preprocessing import prepare_input
-
-
-# -------------------------------------------------
-# Compatibility patch for saved Keras models
-# -------------------------------------------------
-
-_original_dense_init = keras.layers.Dense.__init__
-
-
-def patched_dense_init(self, *args, **kwargs):
-    kwargs.pop("quantization_config", None)
-    _original_dense_init(self, *args, **kwargs)
-
-
-keras.layers.Dense.__init__ = patched_dense_init
 
 
 # -------------------------------------------------
@@ -28,55 +12,25 @@ keras.layers.Dense.__init__ = patched_dense_init
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
-
-
-# -------------------------------------------------
-# Load models and scalers
-# -------------------------------------------------
-
-print("Loading prediction models...")
-
-LSTM_MODEL = load_model(
-    os.path.join(
-        MODEL_DIR,
-        "lstm",
-        "lstm_baseline_best.keras"
-    ),
-    compile=False
-)
-
-print("✓ LSTM model loaded")
-
-CNN_MODEL = load_model(
-    os.path.join(
-        MODEL_DIR,
-        "cnn_lstm",
-        "cnn_lstm_hybrid_best.keras"
-    ),
-    compile=False
-)
-
-print("✓ CNN/LSTM model loaded")
-
-with open(
-    os.path.join(
-        MODEL_DIR,
-        "scalers.pkl"
-    ),
-    "rb"
-) as file:
-    SCALERS = pickle.load(file)
-
-print("✓ Scalers loaded")
+SCALERS_PATH = os.path.join(MODEL_DIR, "scalers.pkl")
 
 
 # -------------------------------------------------
 # Supported tickers
 # -------------------------------------------------
 
-SUPPORTED_TICKERS = list(
-    SCALERS["ticker_scalers"].keys()
-)
+SUPPORTED_TICKERS = [
+    "AZN.L",
+    "BLND.L",
+    "BP.L",
+    "CCC.L",
+    "GSK.L",
+    "LAND.L",
+    "SGE.L",
+    "SHEL.L",
+    "TSCO.L",
+    "ULVR.L"
+]
 
 
 # -------------------------------------------------
@@ -112,153 +66,201 @@ PRICE_FEATURES = [
 
 
 # -------------------------------------------------
+# Lazy-loaded scaler cache
+# -------------------------------------------------
+
+SCALERS: dict[str, Any] | None = None
+
+
+def get_scalers() -> dict[str, Any]:
+    """Load the scaler file only when a prediction is requested."""
+
+    global SCALERS
+
+    if SCALERS is None:
+        if not os.path.isfile(SCALERS_PATH):
+            raise FileNotFoundError(
+                f"Scaler file was not found at: {SCALERS_PATH}"
+            )
+
+        with open(SCALERS_PATH, "rb") as file:
+            SCALERS = pickle.load(file)
+
+        print("Scalers loaded", flush=True)
+
+    return SCALERS
+
+
+# -------------------------------------------------
+# Keras compatibility and model loading
+# -------------------------------------------------
+
+def load_prediction_model(model_name: str):
+    """
+    Import Keras and load only the model selected by the request.
+
+    The model is not kept globally, which helps reduce memory pressure on
+    Render's 512 MiB free instance after each prediction finishes.
+    """
+
+    import keras
+    from keras.models import load_model
+
+    original_dense_init = keras.layers.Dense.__init__
+
+    if not getattr(keras.layers.Dense.__init__, "_stock_ai_patched", False):
+        def patched_dense_init(self, *args, **kwargs):
+            kwargs.pop("quantization_config", None)
+            original_dense_init(self, *args, **kwargs)
+
+        patched_dense_init._stock_ai_patched = True
+        keras.layers.Dense.__init__ = patched_dense_init
+
+    if model_name == "lstm":
+        model_path = os.path.join(
+            MODEL_DIR,
+            "lstm",
+            "lstm_baseline_best.keras"
+        )
+
+    elif model_name in {"cnn", "cnn_lstm", "cnn-lstm"}:
+        model_path = os.path.join(
+            MODEL_DIR,
+            "cnn_lstm",
+            "cnn_lstm_hybrid_best.keras"
+        )
+
+    else:
+        raise ValueError(
+            "Invalid model name. Use 'lstm' or 'cnn_lstm'."
+        )
+
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(
+            f"Prediction model was not found at: {model_path}"
+        )
+
+    print(f"Loading {model_name} model...", flush=True)
+
+    return load_model(
+        model_path,
+        compile=False
+    )
+
+
+# -------------------------------------------------
 # Prediction function
 # -------------------------------------------------
 
-def predict_stock(ticker: str, model_name: str = "lstm"):
-    ticker = ticker.upper()
-    model_name = model_name.lower()
+def predict_stock(ticker: str, model_name: str = "lstm") -> dict:
+    ticker = ticker.upper().strip()
+    model_name = model_name.lower().strip()
 
-    # Check ticker
     if ticker not in SUPPORTED_TICKERS:
         raise ValueError(
             f"Ticker '{ticker}' is not supported. "
             f"Supported tickers: {', '.join(SUPPORTED_TICKERS)}"
         )
 
-    # Select model
-    if model_name == "lstm":
-        model = LSTM_MODEL
-
-    elif model_name in [
-        "cnn",
-        "cnn_lstm",
-        "cnn-lstm"
-    ]:
-        model = CNN_MODEL
-
-    else:
+    if model_name not in {"lstm", "cnn", "cnn_lstm", "cnn-lstm"}:
         raise ValueError(
-            "Invalid model name. "
-            "Use 'lstm' or 'cnn_lstm'."
+            "Invalid model name. Use 'lstm' or 'cnn_lstm'."
         )
 
-    # Create input with shape (1, 60, 36)
-    X, dataframe = prepare_input(ticker)
+    model = None
 
-    # Make model prediction
-    predictions = model.predict(
-        X,
-        verbose=0
-    )
+    try:
+        # These heavy imports now happen only after the API is already live.
+        from app.preprocessing import prepare_input
 
-    # First output: scaled next-day return
-    predicted_return_scaled = float(
-        np.asarray(
-            predictions[0]
-        ).reshape(-1)[0]
-    )
+        scalers = get_scalers()
+        model = load_prediction_model(model_name)
 
-    # Second output: probability of upward movement
-    direction_probability = float(
-        np.asarray(
-            predictions[1]
-        ).reshape(-1)[0]
-    )
+        # Create input with shape (1, 60, 36)
+        X, dataframe = prepare_input(ticker)
 
-    # Get ticker-specific scaler
-    ticker_scaler = SCALERS[
-        "ticker_scalers"
-    ][ticker]
+        predictions = model.predict(
+            X,
+            verbose=0
+        )
 
-    # Locate Daily_Return in the feature list
-    daily_return_index = PRICE_FEATURES.index(
-        "Daily_Return"
-    )
+        predicted_return_scaled = float(
+            np.asarray(predictions[0]).reshape(-1)[0]
+        )
 
-    # Create an empty scaled feature row
-    inverse_input = np.zeros(
-        (1, len(PRICE_FEATURES))
-    )
+        direction_probability = float(
+            np.asarray(predictions[1]).reshape(-1)[0]
+        )
 
-    # Insert predicted scaled return
-    inverse_input[
-        0,
-        daily_return_index
-    ] = predicted_return_scaled
+        ticker_scaler = scalers["ticker_scalers"][ticker]
+        daily_return_index = PRICE_FEATURES.index("Daily_Return")
 
-    # Convert scaled return to original value
-    inverse_result = ticker_scaler.inverse_transform(
-        inverse_input
-    )
+        inverse_input = np.zeros(
+            (1, len(PRICE_FEATURES))
+        )
 
-    predicted_return = float(
-        inverse_result[
-            0,
-            daily_return_index
-        ]
-    )
+        inverse_input[0, daily_return_index] = (
+            predicted_return_scaled
+        )
 
-    # Get latest actual closing price
-    last_close = float(
-        dataframe["Close"].iloc[-1]
-    )
+        inverse_result = ticker_scaler.inverse_transform(
+            inverse_input
+        )
 
-    # Calculate predicted next price
-    predicted_price = (
-        last_close
-        * (1 + predicted_return)
-    )
+        predicted_return = float(
+            inverse_result[0, daily_return_index]
+        )
 
-    # -------------------------------------------------
-    # Direction and recommendation
-    # -------------------------------------------------
+        last_close = float(
+            dataframe["Close"].iloc[-1]
+        )
 
-    if direction_probability >= 0.55:
-        predicted_direction = "UP"
+        predicted_price = last_close * (1 + predicted_return)
 
-    elif direction_probability <= 0.45:
-        predicted_direction = "DOWN"
+        if direction_probability >= 0.55:
+            predicted_direction = "UP"
+            recommendation = "BUY"
+        elif direction_probability <= 0.45:
+            predicted_direction = "DOWN"
+            recommendation = "SELL"
+        else:
+            predicted_direction = "UNCERTAIN"
+            recommendation = "HOLD"
 
-    else:
-        predicted_direction = "UNCERTAIN"
+        normalized_model_name = (
+            "cnn_lstm"
+            if model_name in {"cnn", "cnn_lstm", "cnn-lstm"}
+            else "lstm"
+        )
 
-    if direction_probability >= 0.55:
-        recommendation = "BUY"
+        return {
+            "ticker": ticker,
+            "model": normalized_model_name,
+            "last_close": round(last_close, 4),
+            "predicted_return": round(predicted_return, 6),
+            "predicted_return_percent": round(
+                predicted_return * 100,
+                4
+            ),
+            "predicted_price": round(predicted_price, 4),
+            "direction": predicted_direction,
+            "direction_probability": round(
+                direction_probability,
+                4
+            ),
+            "recommendation": recommendation
+        }
 
-    elif direction_probability <= 0.45:
-        recommendation = "SELL"
+    finally:
+        # Release the loaded model after the request. TensorFlow itself may
+        # retain some memory, but this prevents both models being held at once.
+        if model is not None:
+            del model
 
-    else:
-        recommendation = "HOLD"
+        try:
+            import keras
+            keras.backend.clear_session()
+        except Exception:
+            pass
 
-    # -------------------------------------------------
-    # Return result
-    # -------------------------------------------------
-
-    return {
-        "ticker": ticker,
-        "model": model_name,
-        "last_close": round(
-            last_close,
-            4
-        ),
-        "predicted_return": round(
-            predicted_return,
-            6
-        ),
-        "predicted_return_percent": round(
-            predicted_return * 100,
-            4
-        ),
-        "predicted_price": round(
-            predicted_price,
-            4
-        ),
-        "direction": predicted_direction,
-        "direction_probability": round(
-            direction_probability,
-            4
-        ),
-        "recommendation": recommendation
-    }
+        gc.collect()
