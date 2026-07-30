@@ -11,3 +11,4 @@ torch
 chronos-forecasting
 joblib
 ta
+scikit-learn==1.6.1
