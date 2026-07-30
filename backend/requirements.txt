@@ -7,3 +7,6 @@ python-multipart
 yfinance
 matplotlib
 tensorflow
+torch
+chronos-forecasting
+joblib
