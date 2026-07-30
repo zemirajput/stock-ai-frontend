@@ -1,4 +1,5 @@
 import os
+import threading
 from typing import Any
 
 import numpy as np
@@ -41,32 +42,59 @@ else:
 
 
 # -------------------------------------------------
-# Load Chronos-2 model
+# Lazy-load Chronos-2 model
 # -------------------------------------------------
 
-print(
-    "Loading Chronos-2 transfer-learning model..."
-)
+CHRONOS_PIPELINE = None
+CHRONOS_MODEL_LOCK = threading.Lock()
 
-if not os.path.isdir(
-    CHRONOS_MODEL_DIR
-):
-    raise FileNotFoundError(
-        "Chronos-2 model folder was not found at: "
-        f"{CHRONOS_MODEL_DIR}"
-    )
 
-CHRONOS_PIPELINE = (
-    Chronos2Pipeline.from_pretrained(
-        CHRONOS_MODEL_DIR,
-        device_map=DEVICE,
-        dtype=TORCH_DTYPE
-    )
-)
+def get_chronos_pipeline() -> Chronos2Pipeline:
+    """
+    Load the Chronos-2 model only when it is first needed.
 
-print(
-    f"✓ Chronos-2 model loaded on {DEVICE}"
-)
+    Loading the model lazily allows FastAPI and Uvicorn to
+    start and bind to the Render service port immediately.
+    """
+
+    global CHRONOS_PIPELINE
+
+    if CHRONOS_PIPELINE is not None:
+        return CHRONOS_PIPELINE
+
+    with CHRONOS_MODEL_LOCK:
+        # Check again in case another request loaded the model
+        # while this request was waiting for the lock.
+        if CHRONOS_PIPELINE is not None:
+            return CHRONOS_PIPELINE
+
+        print(
+            "Loading Chronos-2 transfer-learning model...",
+            flush=True
+        )
+
+        if not os.path.isdir(
+            CHRONOS_MODEL_DIR
+        ):
+            raise FileNotFoundError(
+                "Chronos-2 model folder was not found at: "
+                f"{CHRONOS_MODEL_DIR}"
+            )
+
+        CHRONOS_PIPELINE = (
+            Chronos2Pipeline.from_pretrained(
+                CHRONOS_MODEL_DIR,
+                device_map=DEVICE,
+                dtype=TORCH_DTYPE
+            )
+        )
+
+        print(
+            f"Chronos-2 model loaded on {DEVICE}",
+            flush=True
+        )
+
+    return CHRONOS_PIPELINE
 
 
 # -------------------------------------------------
@@ -97,7 +125,8 @@ def download_stock_history(
 ) -> pd.DataFrame:
 
     print(
-        f"Downloading Chronos data for {ticker}..."
+        f"Downloading Chronos data for {ticker}...",
+        flush=True
     )
 
     dataframe = yf.download(
@@ -105,10 +134,11 @@ def download_stock_history(
         period=period,
         interval="1d",
         auto_adjust=False,
-        progress=False
+        progress=False,
+        threads=False
     )
 
-    if dataframe.empty:
+    if dataframe is None or dataframe.empty:
         raise ValueError(
             f"No stock data was downloaded for {ticker}."
         )
@@ -198,7 +228,7 @@ def download_stock_history(
     )
 
     # Fill holidays and missing business dates using
-    # the previous closing price
+    # the previous closing price.
     dataframe["Close"] = dataframe[
         "Close"
     ].ffill()
@@ -224,12 +254,14 @@ def download_stock_history(
 
     print(
         f"Chronos data frequency: "
-        f"{inferred_frequency}"
+        f"{inferred_frequency}",
+        flush=True
     )
 
     print(
         f"Chronos history rows: "
-        f"{len(dataframe)}"
+        f"{len(dataframe)}",
+        flush=True
     )
 
     return dataframe
@@ -361,8 +393,12 @@ def predict_transfer_stock(
         ]
     ].copy()
 
+    # Load the model only when a Chronos prediction
+    # is requested.
+    pipeline = get_chronos_pipeline()
+
     # Make one-step-ahead forecast
-    forecast = CHRONOS_PIPELINE.predict_df(
+    forecast = pipeline.predict_df(
         context_dataframe,
         prediction_length=1,
         quantile_levels=[
@@ -390,7 +426,7 @@ def predict_transfer_stock(
     )
 
     # Chronos predicts price directly, so use the
-    # predicted percentage movement for recommendation
+    # predicted percentage movement for recommendation.
     if predicted_return_percent >= 0.5:
         direction = "UP"
         recommendation = "BUY"
