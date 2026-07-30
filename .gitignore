@@ -1,0 +1,33 @@
+# Keep these folders locally but do not upload them
+node_modules/
+backend/venv/
+backend/.venv/
+venv/
+.venv/
+
+# Generated frontend files
+dist/
+
+# Python temporary files
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment secrets
+.env
+.env.local
+.env.*.local
+
+# Cache files
+.ipynb_checkpoints/
+.pytest_cache/
+.cache/
+
+# Editor and Windows files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
