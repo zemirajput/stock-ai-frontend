@@ -120,32 +120,75 @@ def load_local_stock_data(
     ticker: str
 ) -> pd.DataFrame:
     """
-    Load stock history from the local CSV when Yahoo
-    Finance is unavailable or rate-limits Render.
+    Load OHLCV stock history from data/stock_history.csv
+    when Yahoo Finance is unavailable or rate-limits Render.
     """
+
+    ticker = ticker.upper().strip()
 
     fallback_path = os.path.join(
         DATA_DIR,
-        "transfer_learning_series.csv"
+        "stock_history.csv"
     )
 
-    if not os.path.isfile(
-        fallback_path
-    ):
+    print(
+        f"Loading fallback stock data from: {fallback_path}",
+        flush=True
+    )
+
+    if not os.path.isfile(fallback_path):
         raise FileNotFoundError(
             "Yahoo Finance was unavailable and the "
-            "fallback file was not found at: "
+            "fallback stock-history file was not found at: "
             f"{fallback_path}"
         )
 
-    fallback = pd.read_csv(
-        fallback_path
-    )
+    fallback = pd.read_csv(fallback_path)
+
+    # Remove accidental spaces and quotes from CSV headings.
+    fallback.columns = [
+        str(column).strip().replace('\"', '').replace("'", '')
+        for column in fallback.columns
+    ]
+
+    # Support common yfinance-generated column-name variations.
+    required_names = [
+        "Date",
+        "Ticker",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    for required_name in required_names:
+        if required_name in fallback.columns:
+            continue
+
+        candidates = [
+            column
+            for column in fallback.columns
+            if column.lower() == required_name.lower()
+            or column.lower().startswith(required_name.lower() + "_")
+            or column.lower().endswith("_" + required_name.lower())
+        ]
+
+        if candidates:
+            fallback = fallback.rename(
+                columns={candidates[0]: required_name}
+            )
 
     if "Ticker" not in fallback.columns:
         raise ValueError(
-            "The fallback dataset does not contain "
-            "a Ticker column."
+            "stock_history.csv does not contain a Ticker column. "
+            f"Available columns: {fallback.columns.tolist()}"
+        )
+
+    if "Date" not in fallback.columns:
+        raise ValueError(
+            "stock_history.csv does not contain a Date column. "
+            f"Available columns: {fallback.columns.tolist()}"
         )
 
     fallback["Ticker"] = (
@@ -161,16 +204,13 @@ def load_local_stock_data(
 
     if fallback.empty:
         raise ValueError(
-            f"Yahoo Finance was unavailable and no "
-            f"local data was found for {ticker}."
+            f"Yahoo Finance was unavailable and no local "
+            f"stock history was found for {ticker}."
         )
 
-    fallback = clean_date_column(
-        fallback
-    )
+    fallback = clean_date_column(fallback)
 
     required_stock_columns = [
-        "Date",
         "Open",
         "High",
         "Low",
@@ -186,18 +226,12 @@ def load_local_stock_data(
 
     if missing_columns:
         raise ValueError(
-            "The fallback dataset cannot be used for "
-            "stock prediction because it is missing: "
+            "stock_history.csv cannot be used because it is missing: "
             + ", ".join(missing_columns)
+            + f". Available columns: {fallback.columns.tolist()}"
         )
 
-    for column in [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume"
-    ]:
+    for column in required_stock_columns:
         fallback[column] = pd.to_numeric(
             fallback[column],
             errors="coerce"
@@ -205,6 +239,14 @@ def load_local_stock_data(
 
     if "Adj Close" not in fallback.columns:
         fallback["Adj Close"] = fallback["Close"]
+    else:
+        fallback["Adj Close"] = pd.to_numeric(
+            fallback["Adj Close"],
+            errors="coerce"
+        )
+        fallback["Adj Close"] = fallback["Adj Close"].fillna(
+            fallback["Close"]
+        )
 
     fallback = fallback.replace(
         [np.inf, -np.inf],
@@ -212,27 +254,24 @@ def load_local_stock_data(
     )
 
     fallback = fallback.dropna(
-        subset=[
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]
+        subset=required_stock_columns
     )
 
-    fallback = fallback.sort_values(
-        "Date"
+    fallback = (
+        fallback
+        .sort_values("Date")
+        .drop_duplicates(subset=["Date"], keep="last")
+        .reset_index(drop=True)
     )
 
-    fallback = fallback.drop_duplicates(
-        subset=["Date"],
-        keep="last"
-    )
+    if len(fallback) < 60:
+        raise ValueError(
+            f"Only {len(fallback)} local stock rows were found "
+            f"for {ticker}; at least 60 are required."
+        )
 
     print(
-        f"Loaded {len(fallback)} local stock rows "
-        f"for {ticker}.",
+        f"Loaded {len(fallback)} local stock rows for {ticker}.",
         flush=True
     )
 
@@ -250,7 +289,7 @@ def get_stock_data(
     Download historical stock prices from Yahoo.
 
     If Yahoo returns no data because of a rate limit,
-    use the local training CSV as a fallback.
+    use the local OHLCV stock-history CSV as a fallback.
     """
 
     ticker = ticker.upper().strip()
