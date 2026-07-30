@@ -73,16 +73,18 @@ with open(
 ) as file:
     SCALERS = pickle.load(file)
 
+print("Scalers loaded", flush=True)
+
 
 # -------------------------------------------------
-# Date cleaning helper
+# Date cleaning
 # -------------------------------------------------
 
 def clean_date_column(
     dataframe: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Convert the Date column to timezone-naive pandas
+    Convert Date values into timezone-naive pandas
     datetime values.
     """
 
@@ -111,6 +113,133 @@ def clean_date_column(
 
 
 # -------------------------------------------------
+# Load fallback stock history
+# -------------------------------------------------
+
+def load_local_stock_data(
+    ticker: str
+) -> pd.DataFrame:
+    """
+    Load stock history from the local CSV when Yahoo
+    Finance is unavailable or rate-limits Render.
+    """
+
+    fallback_path = os.path.join(
+        DATA_DIR,
+        "transfer_learning_series.csv"
+    )
+
+    if not os.path.isfile(
+        fallback_path
+    ):
+        raise FileNotFoundError(
+            "Yahoo Finance was unavailable and the "
+            "fallback file was not found at: "
+            f"{fallback_path}"
+        )
+
+    fallback = pd.read_csv(
+        fallback_path
+    )
+
+    if "Ticker" not in fallback.columns:
+        raise ValueError(
+            "The fallback dataset does not contain "
+            "a Ticker column."
+        )
+
+    fallback["Ticker"] = (
+        fallback["Ticker"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    fallback = fallback[
+        fallback["Ticker"] == ticker
+    ].copy()
+
+    if fallback.empty:
+        raise ValueError(
+            f"Yahoo Finance was unavailable and no "
+            f"local data was found for {ticker}."
+        )
+
+    fallback = clean_date_column(
+        fallback
+    )
+
+    required_stock_columns = [
+        "Date",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    missing_columns = [
+        column
+        for column in required_stock_columns
+        if column not in fallback.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "The fallback dataset cannot be used for "
+            "stock prediction because it is missing: "
+            + ", ".join(missing_columns)
+        )
+
+    for column in [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]:
+        fallback[column] = pd.to_numeric(
+            fallback[column],
+            errors="coerce"
+        )
+
+    if "Adj Close" not in fallback.columns:
+        fallback["Adj Close"] = fallback["Close"]
+
+    fallback = fallback.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    fallback = fallback.dropna(
+        subset=[
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+    )
+
+    fallback = fallback.sort_values(
+        "Date"
+    )
+
+    fallback = fallback.drop_duplicates(
+        subset=["Date"],
+        keep="last"
+    )
+
+    print(
+        f"Loaded {len(fallback)} local stock rows "
+        f"for {ticker}.",
+        flush=True
+    )
+
+    return fallback
+
+
+# -------------------------------------------------
 # Download stock data
 # -------------------------------------------------
 
@@ -118,58 +247,87 @@ def get_stock_data(
     ticker: str
 ) -> pd.DataFrame:
     """
-    Download enough history to create indicators and
-    retain at least 60 complete input rows.
+    Download historical stock prices from Yahoo.
+
+    If Yahoo returns no data because of a rate limit,
+    use the local training CSV as a fallback.
     """
 
-    dataframe = yf.download(
-        ticker,
-        period="5y",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False
-    )
-
-    if dataframe is None or dataframe.empty:
-        raise ValueError(
-            f"No stock data was downloaded for {ticker}."
-        )
-
-    # Fix yfinance MultiIndex columns.
-    if isinstance(
-        dataframe.columns,
-        pd.MultiIndex
-    ):
-        dataframe.columns = [
-            column[0]
-            if isinstance(column, tuple)
-            else column
-            for column in dataframe.columns
-        ]
-
-    dataframe = dataframe.reset_index()
-
-    dataframe = clean_date_column(
-        dataframe
-    )
-
-    dataframe = dataframe.sort_values(
-        "Date"
-    )
-
-    dataframe = dataframe.drop_duplicates(
-        subset=["Date"],
-        keep="last"
-    )
+    ticker = ticker.upper().strip()
 
     print(
-        f"Downloaded {len(dataframe)} stock rows "
-        f"for {ticker}.",
+        f"Downloading stock data for {ticker}...",
         flush=True
     )
 
-    return dataframe
+    dataframe = pd.DataFrame()
+
+    try:
+        dataframe = yf.download(
+            ticker,
+            period="5y",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=20,
+            multi_level_index=False
+        )
+
+    except Exception as download_error:
+        print(
+            "Yahoo Finance download raised an error: "
+            f"{download_error}",
+            flush=True
+        )
+
+    if (
+        dataframe is not None
+        and not dataframe.empty
+    ):
+        if isinstance(
+            dataframe.columns,
+            pd.MultiIndex
+        ):
+            dataframe.columns = [
+                column[0]
+                if isinstance(column, tuple)
+                else column
+                for column in dataframe.columns
+            ]
+
+        dataframe = dataframe.reset_index()
+
+        dataframe = clean_date_column(
+            dataframe
+        )
+
+        dataframe = dataframe.sort_values(
+            "Date"
+        )
+
+        dataframe = dataframe.drop_duplicates(
+            subset=["Date"],
+            keep="last"
+        )
+
+        print(
+            f"Downloaded {len(dataframe)} Yahoo rows "
+            f"for {ticker}.",
+            flush=True
+        )
+
+        return dataframe
+
+    print(
+        "Yahoo Finance returned no stock data. "
+        "Using local dataset fallback...",
+        flush=True
+    )
+
+    return load_local_stock_data(
+        ticker
+    )
 
 
 # -------------------------------------------------
@@ -180,8 +338,8 @@ def add_macro_changes(
     dataframe: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Add percentage-change columns for macro variables
-    when those columns do not already exist.
+    Add percentage-change columns for macroeconomic
+    variables.
     """
 
     dataframe = dataframe.copy()
@@ -202,11 +360,13 @@ def add_macro_changes(
             column in dataframe.columns
             and change_column not in dataframe.columns
         ):
+            numeric_values = pd.to_numeric(
+                dataframe[column],
+                errors="coerce"
+            )
+
             dataframe[change_column] = (
-                pd.to_numeric(
-                    dataframe[column],
-                    errors="coerce"
-                )
+                numeric_values
                 .pct_change(
                     fill_method=None
                 )
@@ -228,7 +388,8 @@ def load_macro_data(
     ticker: str
 ) -> pd.DataFrame:
     """
-    Load and prepare macroeconomic data for one ticker.
+    Load macroeconomic features for the requested
+    ticker.
     """
 
     macro_path = os.path.join(
@@ -240,7 +401,7 @@ def load_macro_data(
         macro_path
     ):
         raise FileNotFoundError(
-            "Macro data file was not found at: "
+            "Macro dataset was not found at: "
             f"{macro_path}"
         )
 
@@ -252,25 +413,28 @@ def load_macro_data(
         macro
     )
 
-    if "Ticker" in macro.columns:
-        macro["Ticker"] = (
-            macro["Ticker"]
-            .astype(str)
-            .str.upper()
-            .str.strip()
+    if "Ticker" not in macro.columns:
+        raise ValueError(
+            "The macro dataset does not contain a "
+            "Ticker column."
         )
 
-        macro = macro[
-            macro["Ticker"] == ticker
-        ].copy()
+    macro["Ticker"] = (
+        macro["Ticker"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    macro = macro[
+        macro["Ticker"] == ticker
+    ].copy()
 
     if macro.empty:
         raise ValueError(
             f"No macro data was found for {ticker}."
         )
 
-    # Calculate percentage changes only after filtering
-    # the data for the requested ticker.
     macro = macro.sort_values(
         "Date"
     )
@@ -294,15 +458,14 @@ def load_macro_data(
 
 
 # -------------------------------------------------
-# Validate required columns
+# Validate model columns
 # -------------------------------------------------
 
 def validate_feature_columns(
     dataframe: pd.DataFrame
 ) -> None:
     """
-    Confirm that every model feature exists before
-    scaling and prediction.
+    Confirm all model input columns exist.
     """
 
     missing_columns = [
@@ -313,7 +476,7 @@ def validate_feature_columns(
 
     if missing_columns:
         raise ValueError(
-            "The prepared data is missing these model "
+            "Prepared data is missing these model "
             "features: "
             + ", ".join(missing_columns)
         )
@@ -328,11 +491,8 @@ def merge_stock_and_macro(
     macro: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Match each stock date with the most recent available
+    Match every stock date with the latest available
     macroeconomic observation.
-
-    merge_asof is used because stock and macro dates do
-    not necessarily occur on exactly the same day.
     """
 
     stock = stock.sort_values(
@@ -343,9 +503,6 @@ def merge_stock_and_macro(
         "Date"
     ).copy()
 
-    # Avoid duplicate stock-price columns from the macro
-    # dataset. Keep Date and only columns needed by the
-    # trained model.
     macro_columns_to_keep = [
         "Date"
     ]
@@ -370,9 +527,6 @@ def merge_stock_and_macro(
         direction="backward"
     )
 
-    # Rows earlier than the first macro observation may
-    # still be empty. Backfill them using the earliest
-    # available macro values.
     available_macro_columns = [
         column
         for column in MACRO_FEATURES
@@ -394,16 +548,16 @@ def merge_stock_and_macro(
 
 
 # -------------------------------------------------
-# Prepare model input
+# Prepare prediction input
 # -------------------------------------------------
 
 def prepare_input(
     ticker: str
 ):
     """
-    Prepare one model sequence with shape:
+    Prepare a model input sequence with shape:
 
-        (1, 60, number_of_features)
+    (1, 60, number_of_features)
     """
 
     ticker = ticker.upper().strip()
@@ -413,12 +567,14 @@ def prepare_input(
         flush=True
     )
 
-    # -------------------------------------------------
-    # Stock data and technical indicators
-    # -------------------------------------------------
-
+    # Stock prices
     stock = get_stock_data(
         ticker
+    )
+
+    print(
+        f"Stock rows before indicators: {len(stock)}",
+        flush=True
     )
 
     stock = add_indicators(
@@ -433,18 +589,17 @@ def prepare_input(
         "Date"
     )
 
-    # -------------------------------------------------
-    # Macro data
-    # -------------------------------------------------
+    print(
+        f"Stock rows after indicators: {len(stock)}",
+        flush=True
+    )
 
+    # Macro data
     macro = load_macro_data(
         ticker
     )
 
-    # -------------------------------------------------
-    # Merge using the most recent macro observation
-    # -------------------------------------------------
-
+    # Merge stock and macro features
     dataframe = merge_stock_and_macro(
         stock=stock,
         macro=macro
@@ -463,22 +618,20 @@ def prepare_input(
         dataframe
     )
 
-    # Convert model input columns to numeric.
+    # Convert model features to numeric values.
     for column in ALL_FEATURES:
         dataframe[column] = pd.to_numeric(
             dataframe[column],
             errors="coerce"
         )
 
-    # Drop rows only when one of the actual model
-    # features is missing. Do not use dataframe.dropna()
-    # on unrelated columns.
+    # Only remove rows missing actual model features.
     dataframe = dataframe.dropna(
         subset=ALL_FEATURES
     ).copy()
 
     print(
-        f"Complete processed rows available: "
+        "Complete processed rows available: "
         f"{len(dataframe)}",
         flush=True
     )
@@ -490,18 +643,12 @@ def prepare_input(
             f"{len(dataframe)}."
         )
 
-    # -------------------------------------------------
-    # Select features in the exact training order
-    # -------------------------------------------------
-
+    # Exact feature order used during training.
     features = dataframe[
         ALL_FEATURES
     ].copy()
 
-    # -------------------------------------------------
-    # Scale price features
-    # -------------------------------------------------
-
+    # Price scaler
     ticker_scalers = SCALERS.get(
         "ticker_scalers",
         {}
@@ -525,10 +672,7 @@ def prepare_input(
         ]
     )
 
-    # -------------------------------------------------
-    # Scale macro features
-    # -------------------------------------------------
-
+    # Macro scaler
     if "macro_scaler" not in SCALERS:
         raise ValueError(
             "The macro scaler was not found in "
@@ -548,10 +692,7 @@ def prepare_input(
         ]
     )
 
-    # -------------------------------------------------
-    # Select the latest 60 complete rows
-    # -------------------------------------------------
-
+    # Latest 60 days
     sequence = features.tail(
         60
     )
